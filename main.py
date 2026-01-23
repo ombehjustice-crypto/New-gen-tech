@@ -10,7 +10,23 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 
 TOKEN = "8597020255:AAF20Lvuy1fLBTU7h1CUYOXqOnCyfzLUTFA"
 NEWS_API = "332bf45035354091b59f1f64601e2e11"
-FX_API = "ca1acbf0cedb4488b130c59252891c5e"
+TWELVE_API = "ca1acbf0cedb4488b130c59252891c5e"
+
+def crypto_data(sym, tf, l=500):
+    """Fetch crypto OHLCV from Twelve Data"""
+    symbol_td = sym[:3] + "/" + sym[3:]
+    return fetch_twelvedata(symbol_td, tf, l)
+
+def forex_data(pair, tf):
+    """Fetch forex OHLCV from Twelve Data"""
+    symbol_td = pair[:3] + "/" + pair[3:]
+    return fetch_twelvedata(symbol_td, tf, 500)
+
+def fetch_twelvedata(symbol, interval="5min", outputsize=500):
+    """Unified Twelve Data fetch"""
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol":
 
 
 MODEL_PATH = "ai_model_portfolio.h5"
