@@ -78,7 +78,7 @@ def forex_data(pair, tf):
             try:
                 r = requests.get(
                     "https://www.alphavantage.co/query",
-                    params={
+                    params={}
                         "function":"FX_INTRADAY",
                         "from_symbol":pair[:3],
                         "to_symbol":pair[3:],
