@@ -1,9 +1,10 @@
-python-telegram-bot==20.5
+
+python-telegram-bot==20
 numpy
 pandas
-ta
-pytz
-textblob
-scikit-learn
-tensorflow
 requests
+ta
+joblib
+scikit-learn
+xgboost
+feedparser
