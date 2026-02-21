@@ -13,8 +13,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 
 TOKEN = "8586615626:AAHryD22Ct8JTZZ9XgGGp9vIvdLRW-Bs0a8"
 DERIV_APP_ID = "128530"
-DERIV_API =f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-
+DERIV_API = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 DB_NAME = "scalper_ai.db"
 MODEL_FILE = "scalper_model.pkl"
@@ -140,17 +139,14 @@ def generate_signal(df1, df5, df15, model):
     rsi_ok = df1["rsi"].iloc[-1] > 50 if bias=="BUY" else df1["rsi"].iloc[-1] < 50
     macd_ok = df1["macd"].iloc[-1] > df1["macd_signal"].iloc[-1] if bias=="BUY" else df1["macd"].iloc[-1] < df1["macd_signal"].iloc[-1]
     confidence = model.predict_proba(df1[["rsi","ema50","atr","macd"]].iloc[-1:])[0][1] if model else 0.5
-    direction = None
-    if sweep and bos and fvg and rsi_ok and macd_ok:
-        direction = bias
-    if not direction:
-        return None
+    direction = bias
     entry = df1["close"].iloc[-1]
     atr = df1["atr"].iloc[-1]
     sl = entry - atr*1.2 if direction=="BUY" else entry + atr*1.2
     tp = entry + atr*2.5 if direction=="BUY" else entry - atr*2.5
     size = position_size(entry, sl)
-    return direction, entry, sl, tp, size, round(confidence*100,2)
+    debug_info = f"Sweep: {sweep}, BOS: {bos}, FVG: {fvg}, EQ: {eq}, RSI_OK: {rsi_ok}, MACD_OK: {macd_ok}"
+    return direction, entry, sl, tp, size, round(confidence*100,2), debug_info
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(name, callback_data=name)] for name in SYMBOLS]
@@ -165,12 +161,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df5 = add_indicators(await fetch_data(symbol,300,300))
         df15 = add_indicators(await fetch_data(symbol,300,900))
         model = load_model(df1)
-        signal = generate_signal(df1,df5,df15,model)
-        if not signal:
-            await query.edit_message_text("No scalping setup")
-            return
-        direction, entry, sl, tp, size, confidence = signal
-        text = f"{query.data}\nDirection: {direction}\nEntry: {entry:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}\nLot: {size:.4f}\nConfidence: {confidence}%"
+        direction, entry, sl, tp, size, confidence, debug_info = generate_signal(df1,df5,df15,model)
+        text = (f"{query.data}\nDirection: {direction}\nEntry: {entry:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}"
+                f"\nLot: {size:.4f}\nConfidence: {confidence}%\n{debug_info}")
         await query.edit_message_text(text)
     except Exception as e:
         await query.edit_message_text(str(e))
