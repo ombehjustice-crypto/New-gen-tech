@@ -1,229 +1,186 @@
-import os, requests, numpy as np, pandas as pd, ta, pytz
-from datetime import datetime, time, timedelta
-from textblob import TextBlob
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-
+import asyncio
+import json
+import os
+import sqlite3
+import joblib
+import numpy as np
+import pandas as pd
+import ta
+import websockets
+from xgboost import XGBClassifier
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-TOKEN = "8597020255:AAF20Lvuy1fLBTU7h1CUYOXqOnCyfzLUTFA"
-NEWS_API = "332bf45035354091b59f1f64601e2e11"
-TWELVE_API = "ca1acbf0cedb4488b130c59252891c5e"
-
-def crypto_data(sym, tf, l=500):
-    """Fetch crypto OHLCV from Twelve Data"""
-    symbol_td = sym[:3] + "/" + sym[3:]
-    return fetch_twelvedata(symbol_td, tf, l)
-
-def forex_data(pair, tf):
-    """Fetch forex OHLCV from Twelve Data"""
-    symbol_td = pair[:3] + "/" + pair[3:]
-    return fetch_twelvedata(symbol_td, tf, 500)
-
-def fetch_twelvedata(symbol, interval="5min", outputsize=500):
-    """Unified Twelve Data fetch"""
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol":
+TOKEN = "8586615626:AAHryD22Ct8JTZZ9XgGGp9vIvdLRW-Bs0a8"
+DERIV_APP_ID = "128530"
+DERIV_API =f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 
-MODEL_PATH = "ai_model_portfolio.h5"
-TRAIN_LOG = "last_train_portfolio.txt"
+DB_NAME = "scalper_ai.db"
+MODEL_FILE = "scalper_model.pkl"
 
-CRYPTO = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT"]
-FOREX = ["EURUSD","GBPUSD","USDJPY","XAUUSD"]
-UTC = pytz.UTC
+ACCOUNT_BALANCE = 1000
+RISK_PER_TRADE = 0.01
 
-portfolio = {}
+SYMBOLS = {
+    "Vol 25": "R_25",
+    "Vol 50": "R_50",
+    "Vol 75": "R_75",
+    "Vol 100": "R_100",
+    "Boom 500": "BOOM500",
+}
 
-def news_sentiment(symbol):
-    try:
-        q = symbol.replace("USDT","")
-        r = requests.get(
-            "https://newsapi.org/v2/everything",
-            params={"q": q, "language": "en", "apiKey": NEWS_API,"pageSize":5},
-            timeout=10
-        ).json()
-        articles = r.get("articles",[])
-        if not articles:
-            return 0
-        score = sum(TextBlob(a.get("title","")).sentiment.polarity for a in articles)
-        return score / len(articles)
-    except:
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS trades(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        direction TEXT,
+        entry REAL,
+        sl REAL,
+        tp REAL,
+        result INTEGER
+    )""")
+    conn.commit()
+    conn.close()
+
+async def fetch_data(symbol, count, granularity):
+    async with websockets.connect(DERIV_API) as ws:
+        req = {
+            "ticks_history": symbol,
+            "adjust_start_time": 1,
+            "count": count,
+            "end": "latest",
+            "style": "candles",
+            "granularity": granularity,
+        }
+        await ws.send(json.dumps(req))
+        res = json.loads(await ws.recv())
+        if "error" in res:
+            raise Exception(res["error"]["message"])
+        df = pd.DataFrame(res["candles"])
+        df["datetime"] = pd.to_datetime(df["epoch"], unit="s")
+        df[["open","high","low","close"]] = df[["open","high","low","close"]].astype(float)
+        return df
+
+def add_indicators(df):
+    df["rsi"] = ta.momentum.RSIIndicator(df["close"],14).rsi()
+    df["ema50"] = ta.trend.EMAIndicator(df["close"],50).ema_indicator()
+    df["atr"] = ta.volatility.AverageTrueRange(df["high"],df["low"],df["close"],14).average_true_range()
+    macd = ta.trend.MACD(df["close"])
+    df["macd"] = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+    df.dropna(inplace=True)
+    return df
+
+def equal_highs_lows(df, tol=0.0001):
+    if abs(df["high"].iloc[-1] - df["high"].iloc[-2]) < tol:
+        return "EQH"
+    if abs(df["low"].iloc[-1] - df["low"].iloc[-2]) < tol:
+        return "EQL"
+    return None
+
+def liquidity_sweep(df):
+    prev_high = df["high"].iloc[-2]
+    prev_low = df["low"].iloc[-2]
+    close = df["close"].iloc[-1]
+    if df["high"].iloc[-1] > prev_high and close < prev_high:
+        return "SELL"
+    if df["low"].iloc[-1] < prev_low and close > prev_low:
+        return "BUY"
+    return None
+
+def break_structure(df):
+    last_high = df["high"].iloc[-3:-1].max()
+    last_low = df["low"].iloc[-3:-1].min()
+    if df["close"].iloc[-1] > last_high:
+        return "BOS_UP"
+    if df["close"].iloc[-1] < last_low:
+        return "BOS_DOWN"
+    return None
+
+def fair_value_gap(df):
+    if df["low"].iloc[-1] > df["high"].iloc[-3]:
+        return "BULL"
+    if df["high"].iloc[-1] < df["low"].iloc[-3]:
+        return "BEAR"
+    return None
+
+def train_model(df):
+    df["target"] = (df["close"].shift(-2) > df["close"]).astype(int)
+    df.dropna(inplace=True)
+    X = df[["rsi","ema50","atr","macd"]]
+    y = df["target"]
+    if len(np.unique(y)) < 2:
+        return None
+    model = XGBClassifier(n_estimators=200,max_depth=5,learning_rate=0.05,eval_metric="logloss")
+    model.fit(X,y)
+    joblib.dump(model,MODEL_FILE)
+    return model
+
+def load_model(df):
+    if not os.path.exists(MODEL_FILE):
+        return train_model(df)
+    return joblib.load(MODEL_FILE)
+
+def position_size(entry, sl):
+    risk_amount = ACCOUNT_BALANCE * RISK_PER_TRADE
+    stop_distance = abs(entry - sl)
+    if stop_distance == 0:
         return 0
+    return risk_amount / stop_distance
 
-def crypto_data(sym, tf, l=1000):
-    """Fetch Binance klines with fallback"""
-    try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol":sym,"interval":tf,"limit":l},
-            timeout=10
-        ).json()
-        if isinstance(r, dict):
-            return pd.DataFrame(columns=["o","h","l","c","v"])
-        df = pd.DataFrame(r, columns=list("tohlcv")+["x"]*6)
-        df[["o","h","l","c","v"]] = df[["o","h","l","c","v"]].astype(float)
-        return df
-    except:
-        return pd.DataFrame(columns=["o","h","l","c","v"])
-
-def forex_data(pair, tf):
-    """Fetch Alpha Vantage FX with retry and fallback intervals"""
-    intervals = ["1min","5min","15min","60min"]
-    for interval in intervals:
-        for attempt in range(3):
-            try:
-                r = requests.get(
-                    "https://www.alphavantage.co/query",
-                    params={}
-                        "function":"FX_INTRADAY",
-                        "from_symbol":pair[:3],
-                        "to_symbol":pair[3:],
-                        "interval":interval,
-                        "apikey":FX_API,
-                        "outputsize":"full"
-                    },
-                    timeout=10
-                ).json()
-                ts = [v for k,v in r.items() if "Time Series" in k]
-                if ts:
-                    df = pd.DataFrame(ts[0]).T.astype(float)
-                    df.rename(columns={"1. open":"o","2. high":"h","3. low":"l","4. close":"c"}, inplace=True)
-                    return df.sort_index()
-            except:
-                continue
-    return pd.DataFrame(columns=["o","h","l","c"])
-
-def enrich(df):
-    if len(df) < 20:
-        return df
-    df["EMA20"] = ta.trend.EMAIndicator(df["c"],20).ema_indicator()
-    df["EMA50"] = ta.trend.EMAIndicator(df["c"],50).ema_indicator()
-    df["RSI"] = ta.momentum.RSIIndicator(df["c"],14).rsi()
-    macd = ta.trend.MACD(df["c"])
-    df["MACD"] = macd.macd()
-    df["MS"] = macd.macd_signal()
-    df["ATR"] = ta.volatility.AverageTrueRange(df["h"],df["l"],df["c"],14).average_true_range()
-    return df.dropna()
-
-class MarketAI:
-    def __init__(self, window=30):
-        self.window = window
-        self.scaler = MinMaxScaler()
-        self.model = self.load_or_create()
-
-    def load_or_create(self):
-        if os.path.exists(MODEL_PATH):
-            try: return load_model(MODEL_PATH)
-            except: os.remove(MODEL_PATH)
-        model = Sequential([
-            LSTM(64, return_sequences=True, input_shape=(self.window,5)),
-            Dropout(0.2),
-            LSTM(32),
-            Dense(1, activation="sigmoid")
-        ])
-        model.compile(optimizer="adam", loss="binary_crossentropy")
-        return model
-
-    def features(self, df):
-        df = df.copy()
-        df["r"] = df["c"].pct_change()
-        df["v"] = df["r"].rolling(10).std()
-        df["rsi"] = ta.momentum.RSIIndicator(df["c"],14).rsi()
-        df["ema"] = ta.trend.EMAIndicator(df["c"],20).ema_indicator()
-        df["ed"] = df["c"] - df["ema"]
-        df = df.dropna()
-        return df[["r","v","rsi","ed","c"]]
-
-    def prepare(self, df):
-        f = self.features(df)
-        if len(f) <= self.window:
-            return None, None
-        s = self.scaler.fit_transform(f)
-        X, y = [], []
-        for i in range(self.window, len(s)-1):
-            X.append(s[i-self.window:i])
-            y.append(1 if f["c"].iloc[i+1] > f["c"].iloc[i] else 0)
-        return np.array(X), np.array(y)
-
-    def train_daily(self, df):
-        X, y = self.prepare(df)
-        if X is None or len(X)==0: return
-        self.model.fit(X, y, epochs=3, batch_size=8, verbose=0)
-        self.model.save(MODEL_PATH)
-
-    def predict(self, df):
-        f = self.features(df)
-        if len(f) < self.window: return None
-        s = self.scaler.fit_transform(f)
-        X = np.array([s[-self.window:]])
-        return float(self.model.predict(X, verbose=0)[0][0])
-
-class RLTrader:
-    def decide(self, prob, news):
-        score = abs(prob-0.5)*2 + abs(news)
-        if score < 0.6: return "NO TRADE", score
-        return ("BUY" if prob>0.5 else "SELL"), score
+def generate_signal(df1, df5, df15, model):
+    bias = "BUY" if df15["close"].iloc[-1] > df15["ema50"].iloc[-1] else "SELL"
+    sweep = liquidity_sweep(df1)
+    bos = break_structure(df1)
+    fvg = fair_value_gap(df1)
+    eq = equal_highs_lows(df1)
+    rsi_ok = df1["rsi"].iloc[-1] > 50 if bias=="BUY" else df1["rsi"].iloc[-1] < 50
+    macd_ok = df1["macd"].iloc[-1] > df1["macd_signal"].iloc[-1] if bias=="BUY" else df1["macd"].iloc[-1] < df1["macd_signal"].iloc[-1]
+    confidence = model.predict_proba(df1[["rsi","ema50","atr","macd"]].iloc[-1:])[0][1] if model else 0.5
+    direction = None
+    if sweep and bos and fvg and rsi_ok and macd_ok:
+        direction = bias
+    if not direction:
+        return None
+    entry = df1["close"].iloc[-1]
+    atr = df1["atr"].iloc[-1]
+    sl = entry - atr*1.2 if direction=="BUY" else entry + atr*1.2
+    tp = entry + atr*2.5 if direction=="BUY" else entry - atr*2.5
+    size = position_size(entry, sl)
+    return direction, entry, sl, tp, size, round(confidence*100,2)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton(a, callback_data=a)] for a in sorted(set(CRYPTO+FOREX))]
-    await update.message.reply_text("Select Asset for AI Trading", reply_markup=InlineKeyboardMarkup(kb))
+    keyboard = [[InlineKeyboardButton(name, callback_data=name)] for name in SYMBOLS]
+    await update.message.reply_text("Synthetic Scalper AI",reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    asset = q.data
-    is_crypto = asset in CRYPTO
-
-    await q.edit_message_text(f"🔍 Analyzing {asset}...\nPlease wait ⏳")
-
-    
-    df = crypto_data(asset,"5m") if is_crypto else forex_data(asset,"5min")
-    df = enrich(df)
-
-    if len(df) < 30:
-        
-        df = crypto_data(asset,"5m") if is_crypto else forex_data(asset,"5min")
-        df = enrich(df)
-        if len(df) < 30:
-            await q.edit_message_text("❌ Market data still loading, try again shortly")
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    symbol = SYMBOLS[query.data]
+    try:
+        df1 = add_indicators(await fetch_data(symbol,300,60))
+        df5 = add_indicators(await fetch_data(symbol,300,300))
+        df15 = add_indicators(await fetch_data(symbol,300,900))
+        model = load_model(df1)
+        signal = generate_signal(df1,df5,df15,model)
+        if not signal:
+            await query.edit_message_text("No scalping setup")
             return
+        direction, entry, sl, tp, size, confidence = signal
+        text = f"{query.data}\nDirection: {direction}\nEntry: {entry:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}\nLot: {size:.4f}\nConfidence: {confidence}%"
+        await query.edit_message_text(text)
+    except Exception as e:
+        await query.edit_message_text(str(e))
 
-    ai = MarketAI()
-    ai.train_daily(df)
-    prob = ai.predict(df)
-    if prob is None:
-        await q.edit_message_text("❌ Analysis incomplete, retry")
-        return
-
-    news = news_sentiment(asset)
-    decision, confidence = RLTrader().decide(prob, news)
-    if decision == "NO TRADE":
-        await q.edit_message_text("⚠️ No high-probability trade found")
-        return
-
-    price = df["c"].iloc[-1]
-    atr = df["ATR"].iloc[-1]
-    sl = price - atr if decision=="BUY" else price + atr
-    tp = price + atr*2 if decision=="BUY" else price - atr*2
-
-    await q.edit_message_text(
-        f"🧠 AI Hedge Fund Trade Plan\n\n"
-        f"Asset: {asset}\n"
-        f"Direction: {decision}\n"
-        f"Entry: {round(price,5)}\n"
-        f"SL: {round(sl,5)}\n"
-        f"TP: {round(tp,5)}\n\n"
-        f"Probability: {round(prob,3)}\n"
-        f"Confidence: {round(confidence*100,1)}%"
-    )
-
-if __name__=="__main__":
+def main():
+    init_db()
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(analyze))
-    print("Bot running")
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CallbackQueryHandler(button))
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
