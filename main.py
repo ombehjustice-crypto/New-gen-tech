@@ -23,7 +23,7 @@ ACCOUNT_BALANCE = 1000
 RISK_PER_TRADE = 0.01
 CONFIDENCE_THRESHOLD = 0.65
 LOSS_STREAK_LIMIT = 3
-TRADE_COOLDOWN = 60  # seconds
+TRADE_COOLDOWN = 60  
 
 SYMBOLS = {
     "Vol 25": "R_25",
@@ -179,15 +179,15 @@ def generate_signal(df1, df5, df15, model, symbol):
     macd_ok = df1["macd"].iloc[-1] > df1["macd_signal"].iloc[-1] if bias=="BUY" else df1["macd"].iloc[-1] < df1["macd_signal"].iloc[-1]
     confidence = model.predict_proba(df1[["rsi","ema50","atr","macd"]].iloc[-1:])[0][1] if model else 0.5
 
-    # Confidence threshold
+     Confidence threshold
     if confidence < CONFIDENCE_THRESHOLD:
         return None
 
-    # Loss streak breaker
+     Loss streak breaker
     if trade_history.get(symbol,[]).count(0) >= LOSS_STREAK_LIMIT:
         return None
 
-    # Trade frequency control
+     Trade frequency control
     now = datetime.utcnow()
     if symbol in last_trade_time and (now - last_trade_time[symbol]).total_seconds() < TRADE_COOLDOWN:
         return None
